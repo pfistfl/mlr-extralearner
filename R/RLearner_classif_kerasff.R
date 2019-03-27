@@ -19,7 +19,7 @@ makeRLearner.classif.kerasff = function() {
       makeNumericLearnerParam(id = "beta_2", lower = 0, upper = 1, default = 0.999,
         requires = quote(optimizer %in% c("adam", "nadam"))),
       makeDiscreteLearnerParam(id = "loss",
-        values = c("categorical_crossentropy", "sparse_categorical_crossentropy"),
+        values = c("categorical_crossentropy", "sparse_categorical_crossentropy", "binary_crossentropy"),
         default = "categorical_crossentropy"),
       makeIntegerLearnerParam(id = "batch_size", lower = 1L, upper = Inf, default = 1L),
       makeIntegerLearnerParam(id = "layers", lower = 1L, upper = 4L, default = 1L),
@@ -50,10 +50,11 @@ makeRLearner.classif.kerasff = function() {
         lower = 0, upper = 1, default = 0),
       makeNumericLearnerParam(id = "validation_split",
         lower = 0, upper = 1, default = 0),
-      makeLogicalLearnerParam(id = "learning_rate_scheduler", default = FALSE)
+      makeLogicalLearnerParam(id = "learning_rate_scheduler", default = FALSE),
+      makeIntegerLearnerParam(id = "nthread", default = 32L, lower = 1L)
     ),
     properties = c("numerics", "prob", "twoclass", "multiclass"),
-    par.vals = list(),
+    par.vals = list(nthread = 32L),
     name = "Keras Fully-Connected NN",
     short.name = "kerasff"
   )
@@ -61,14 +62,17 @@ makeRLearner.classif.kerasff = function() {
 
 
 trainLearner.classif.kerasff  = function(.learner, .task, .subset, .weights = NULL,
-  epochs = 30L, early_stopping_patience = 5L, learning_rate_scheduler = FALSE,
+  epochs = 100L, early_stopping_patience = 5L, learning_rate_scheduler = FALSE,
   optimizer = "adam", lr = 0.001, beta_1 = 0.9, beta_2 = 0.999, momentum = 0, decay = 0,
   rho = 0.9, loss = "categorical_crossentropy", batch_size = 128L, layers = 1,
   batchnorm_dropout = "dropout", input_dropout_rate = 0, dropout_rate = 0,
   units_layer1 = 32, units_layer2 = 32, units_layer3 = 32, units_layer4 = 32, init_layer = "glorot_uniform",
-  act_layer = "relu", l1_reg_layer = 0.01, l2_reg_layer = 0.01, validation_split = 0.2) {
+  act_layer = "relu", l1_reg_layer = 0.01, l2_reg_layer = 0.01, validation_split = 0.2, nthread = 32L) {
 
   require("keras")
+  K = backend()
+  K$set_session(K$tf$Session(config=K$tf$ConfigProto(intra_op_parallelism_threads = nthread, inter_op_parallelism_threads = nthread)))
+
   input_shape = getTaskNFeats(.task)
   output_shape = length(getTaskClassLevels(.task))
   data = getTaskData(.task, .subset, target.extra = TRUE)

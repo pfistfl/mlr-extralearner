@@ -4,7 +4,7 @@ makeRLearner.classif.embed_kerasff = function() {
     cl = "classif.embed_kerasff",
     package = "keras",
     par.set = makeParamSet(
-      makeIntegerLearnerParam(id = "epochs", lower = 1L, default = 30L),
+      makeIntegerLearnerParam(id = "epochs", lower = 0L, default = 30L),
       makeIntegerLearnerParam(id = "early_stopping_patience", lower = 0L, default = 1L),
       makeDiscreteLearnerParam(id = "optimizer",  default = "sgd",
         values = c("sgd", "rmsprop", "adagrad", "adadelta", "adam", "nadam")),
@@ -18,15 +18,10 @@ makeRLearner.classif.embed_kerasff = function() {
         requires = quote(optimizer %in% c("adam", "nadam"))),
       makeNumericLearnerParam(id = "beta_2", lower = 0, upper = 1, default = 0.999,
         requires = quote(optimizer %in% c("adam", "nadam"))),
-      makeDiscreteLearnerParam(id = "loss",
-        values = c("categorical_crossentropy", "sparse_categorical_crossentropy"),
-        default = "categorical_crossentropy"),
       makeIntegerLearnerParam(id = "batch_size", lower = 1L, upper = Inf, default = 1L),
       makeIntegerLearnerParam(id = "n_layers", lower = 1L, upper = 4L, default = 1L),
-      makeDiscreteLearnerParam(id = "batchnorm_dropout",
-        values = c("batchnorm", "dropout", "none"), default = "none"),
-      makeNumericLearnerParam(id = "input_dropout_rate", default = 0, lower = 0, upper = 1, requires = quote(batchnorm_dropout == "dropout")),
-      makeNumericLearnerParam(id = "dropout_rate", default = 0, lower = 0, upper = 1, requires = quote(batchnorm_dropout == "dropout")),
+      makeNumericLearnerParam(id = "dropout_rate", default = 0, lower = 0, upper = 1),
+      makeNumericLearnerParam(id = "embed_dropout_rate", default = 0.05, lower = 0, upper = 1),
       # Neurons / Layers
       makeIntegerLearnerParam(id = "units_layer1", lower = 1L, default = 1L),
       makeIntegerLearnerParam(id = "units_layer2", lower = 1L, default = 1L,
@@ -35,14 +30,6 @@ makeRLearner.classif.embed_kerasff = function() {
         requires = quote(layers >= 3)),
       makeIntegerLearnerParam(id = "units_layer4", lower = 1L, default = 1L,
         requires = quote(layers >= 4)),
-      # Activations
-      makeDiscreteLearnerParam(id = "act_layer",
-        values = c("elu", "relu", "selu", "tanh", "sigmoid","PRelU", "LeakyReLu"),
-        default = "relu"),
-      # Initializers
-      makeDiscreteLearnerParam(id = "init_layer",
-        values = c("glorot_normal", "glorot_uniform", "he_normal", "he_uniform"),
-        default = "glorot_uniform"),
       # Regularizers
       makeNumericLearnerParam(id = "l1_reg_layer",
         lower = 0, upper = 1, default = 0),
@@ -50,7 +37,7 @@ makeRLearner.classif.embed_kerasff = function() {
         lower = 0, upper = 1, default = 0),
       makeNumericLearnerParam(id = "validation_split",
         lower = 0, upper = 1, default = 0),
-      makeLogicalLearnerParam(id = "learning_rate_scheduler", default = FALSE)
+      makeLogicalLearnerParam(id = "learning_rate_scheduler", default = TRUE)
     ),
     properties = c("numerics", "factors", "prob", "twoclass", "multiclass"),
     par.vals = list(),
@@ -61,12 +48,13 @@ makeRLearner.classif.embed_kerasff = function() {
 
 
 trainLearner.classif.embed_kerasff  = function(.learner, .task, .subset, .weights = NULL,
-  epochs = 30L, early_stopping_patience = 10L, learning_rate_scheduler = FALSE,
-  optimizer = "adam", lr = 0.001, beta_1 = 0.9, beta_2 = 0.999, momentum = 0, decay = 0.1,
-  rho = 0.9, batch_size = 128L, embed_dropout_rate = 0.2, dropout_rate = 0.5,
-  units_layer1 = 32, units_layer2 = 32, units_layer3 = 32, units_layer4 = 32,
-  n_layers = 2L,
-  l1_reg_layer = 0, l2_reg_layer = 0, validation_split = 0.2) {
+  epochs = 10L, early_stopping_patience = 5L, learning_rate_scheduler = TRUE,
+  optimizer = "adam", lr = 0.001, beta_1 = 0.9, beta_2 = 0.999, decay = 0.01,
+  momentum = 0, rho = 0.9, batch_size = 256L,
+  embed_dropout_rate = 0.05, dropout_rate = 0.4,
+  n_layers = 3L,
+  units_layer1 = 512, units_layer2 = 256, units_layer3 = 128, units_layer4 = 64,
+  l1_reg_layer = 0, l2_reg_layer = 0, validation_split = 0.2, tensorboard = FALSE) {
 
   require("keras")
   keras = reticulate::import("keras")
@@ -85,29 +73,38 @@ trainLearner.classif.embed_kerasff  = function(.learner, .task, .subset, .weight
   )
 
   callbacks = c()
-  # callback_reduce_lr_on_plateau(monitor = "val_loss", factor = 0.1)
   if (early_stopping_patience > 0)
     callbacks = c(callbacks, callback_early_stopping(monitor = 'val_loss', patience = early_stopping_patience))
   if (learning_rate_scheduler) {
-    clr = function(x) ((sin(x/300)+1)*exp(-x/10000)/100)
-    callback_lr_init <- function(x){
-          iter <<- 0
-          lr_hist <<- c()
+    n_batches = (1 - validation_split) * ceiling(getTaskSize(.task) / batch_size)
+    # clr = function(x) ((sin(x / n_batches * 2 * pi) + 1)*exp(-x/5000) + .01)
+    # clr = function(x) (min(10^-3, (sin(x / (epochs*n_batches) * pi))*exp(-x/5000) + .01))
+    clr = function(x) {
+      max_x = epochs*n_batches
+      lin = 0.3
+      c(
+        seq(from = 0, to = 1, length.out = ceiling(lin * max_x)),
+        (cos(x / max_x * pi) + 1) / 2
+      )
     }
-    callback_lr_set <- function(batch, logs){
-          iter <<- iter + 1
-          learning_r <- clr(iter)
-          k_set_value(model$optimizer$lr, learning_r)
+    callback_lr_init = function(x){
+      iter <<- 0
+      lr_hist <<- c()
     }
-    callback_lr_log <- function(batch, logs){
-          # k_get_value(): https://keras.rstudio.com/articles/backend.html#backend-functions
-          lr_hist <<- c(lr_hist, k_get_value(model$optimizer$lr))
-          #cat(paste0("iter: ",iter," - lr: ",k_get_value(model$optimizer$lr),"\n"))
+    callback_lr_set = function(batch, logs){
+      iter <<- iter + 1
+      learning_r = clr(iter)
+      k_set_value(model$optimizer$lr, lr * learning_r)
+    }
+    callback_lr_log = function(batch, logs){
+      lr_hist <<- c(lr_hist, k_get_value(model$optimizer$lr))    
     }
     callback_lr = callback_lambda(on_train_begin=callback_lr_init, on_batch_begin=callback_lr_set)
     callback_logger = callback_lambda(on_batch_begin=callback_lr_log)
     callbacks = c(callbacks, callback_lr, callback_logger)
   }
+  if (tensorboard)
+    callbacks = c(callbacks, callback_tensorboard("~/Documents/tensorboard_logs"))
 
   # --- Build Up Model -------------------------------------------------------
   units_layers = c(units_layer1, units_layer2, units_layer3, units_layer4)
@@ -130,8 +127,8 @@ trainLearner.classif.embed_kerasff  = function(.learner, .task, .subset, .weight
     # Final layer 
     if (i < n_layers + 1)
     layers = layers %>%
-      layer_dense(units = units_layers[i], kernel_regularizer = regularizer) %>%
-      layer_activation_relu()
+      layer_dense(units = units_layers[i], kernel_regularizer = regularizer, kernel_initializer = initializer_he_normal()) %>%
+      layer_activation_leaky_relu(alpha = 0.3)
     else 
       layers = layers %>% layer_dense(units = output_shape) %>% layer_activation_softmax()
   }
@@ -140,38 +137,25 @@ trainLearner.classif.embed_kerasff  = function(.learner, .task, .subset, .weight
 
   # --- Compile and Fit ---------------------------------------------------------------
   data = reshape_data_embedding(data$data, data$target)
+  
+  if (output_shape == 2) loss = "binary_crossentropy"
+  else loss = "categorical_crossentropy"
 
-  if (output_shape == 2) {
-    model %>% compile(
-      optimizer = "adam",
-      loss =  "binary_crossentropy",
-      metrics = "accuracy"
-    )
+  model %>% compile(
+    optimizer = optimizer,
+    loss = loss,
+    metrics = "accuracy"
+  )
+
+  if (epochs > 0) {
     history = model %>% fit(
       x = data$data,
       y = to_categorical(data$label),
-      # steps_per_epoch = nrow(data$data) %/% batch_size,
-      batch_size = batch_size,
-      epochs  = epochs,
-      validation_split = validation_split,
-      callback = callbacks
-    )
-  } else  {
-    model %>% compile(
-      optimizer = optimizer,
-      loss =  "categorical_crossentropy",
-      metrics = "accuracy"
-    )
-    history = model %>% fit(
-      x = data$data,
-      y = to_categorical(data$label, num_classes = output_shape),
-      # steps_per_epoch = nrow(data$data) %/% batch_size,
       batch_size = batch_size,
       epochs  = epochs,
       validation_split = validation_split
     )
   }
-
   return(list(model = model, history = history, target_levels = target_levels, data = data, history = history))
 }
 
@@ -184,6 +168,7 @@ predictLearner.classif.embed_kerasff = function(.learner, .model, .newdata, ...)
     argmax = apply(p, 1, which.max)
     p = as.factor(.model$learner.model$target_levels[argmax])
   }
+  k_clear_session() 
   return(p)
 }
 
@@ -267,80 +252,87 @@ get_embeddings = function(model, data) {
 
 
 # http://thecooldata.com/2019/01/learning-rate-finder-with-cifar10-keras-r/
-find_lr = function(mlr_mod, batch_size = 128, n_epochs = 5) {
-
+find_lr = function(mlr_mod, batch_size = 128, epochs = 5) {
+  requireNamespace("zoo")
   res = mlr_mod$learner.model$next.model$learner.model
   model = res$model
-  n = round(nrow(res$data$label) * 0.9)
+  n = nrow(res$data$label)
 
-  LogMetrics <- R6::R6Class("LogMetrics",
+  LogMetrics = R6::R6Class("LogMetrics",
     inherit = KerasCallback,
     public = list(
       loss = NULL,
       acc = NULL,
       on_batch_end = function(batch, logs=list()) {
-        self$loss <- c(self$loss, logs[["loss"]])
-        self$acc <- c(self$acc, logs[["acc"]])
+        self$loss = c(self$loss, logs[["loss"]])
+        self$acc = c(self$acc, logs[["acc"]])
       }
   ))
-  callback_lr_init <- function(logs){
+
+  # Define calbacks
+  callback_lr_init = function(logs){
     iter <<- 0
     lr_hist <<- c()
     iter_hist <<- c()
   }
-  callback_lr_set <- function(batch, logs){
-    lr_max <- 0.1
-    n_iter <- ceiling(n_epochs * (n / batch_size))
-    growth_constant <- 15
-    lr_max = 0.1
-    l_rate <- exp(seq(0, growth_constant, length.out=n_iter))
-    l_rate <- l_rate/max(l_rate)
-    l_rate <- l_rate * lr_max
+  callback_lr_set = function(batch, logs){
+    lr_max = .8
+    n_iter = epochs * ceiling((n / batch_size))
+    l_rate = exp(seq(0, 15, length.out = n_iter))
+    l_rate = l_rate / max(l_rate)
+    l_rate = l_rate * lr_max
     iter <<- iter + 1
-    LR <- l_rate[iter] # if number of iterations > l_rate values, make LR constant to last value
-    if(is.na(LR)) LR <- l_rate[length(l_rate)]
+    LR = l_rate[iter] # if number of iterations > l_rate values, make LR constant to last value
+    if(is.na(LR)) LR = l_rate[length(l_rate)]
     k_set_value(model$optimizer$lr, LR)
   }
-  callback_lr_log <- function(batch, logs){
+  callback_lr_log = function(batch, logs){
     lr_hist <<- c(lr_hist, k_get_value(model$optimizer$lr))
     iter_hist <<- c(iter_hist, k_get_value(model$optimizer$iterations))
   }
-  callback_lr <- callback_lambda(on_train_begin=callback_lr_init, on_batch_begin=callback_lr_set)
-  callback_logger <- callback_lambda(on_batch_end=callback_lr_log)
-  callback_log_acc_lr <- LogMetrics$new()
+  callback_lr = callback_lambda(on_train_begin=callback_lr_init, on_batch_begin=callback_lr_set)
+  callback_logger = callback_lambda(on_batch_end=callback_lr_log)
+  callback_log_acc_lr = LogMetrics$new()
 
-  history <- model %>% fit(
+  history = model %>% fit(
       x = res$data$data,
       y =  to_categorical(res$data$label),
       batch_size = batch_size,
-      epochs = n_epochs,
+      epochs = epochs,
       shuffle = TRUE,
       callbacks = list(callback_lr, callback_logger, callback_log_acc_lr),
       verbose = 2)
-  # plot(lr_hist, callback_log_acc_lr$acc, log="x", type="b", pch=16, cex=0.3, xlab="learning rate (log scale)", ylab="accuracy")
   plot(zoo::rollmean(lr_hist, 100), zoo::rollmean(callback_log_acc_lr$acc, 100), log="x", type="l", pch=16, cex=0.3, xlab="learning rate", ylab="accuracy: rollmean(100)")
   return(history)
 }
 
 
 if (FALSE) {
+  # Some tests and checks
   library(OpenML)
   library(checkmate)
   library(mlrCPO)
   library(ggplot2)
   library(dplyr)
+  library(patchwork)
   adult = convertOMLDataSetToMlr(getOMLDataSet(1590))
 
   lrn = cpoImputeMedian(affect.type = "numeric") %>>%
     cpoImputeMode(affect.type = "factor") %>>%
     cpoScale(center = TRUE, scale = TRUE, affect.type = "numeric") %>>%
-    makeLearner("classif.embed_kerasff",
-      lr = 10^-5, epochs = 5, units_layer1 = 128, units_layer2 = 64, units_layer3 = 64, n_layers = 3L,
-      validation_split = 0.1, early_stopping_patience = 5)
+    makeLearner("classif.embed_kerasff", lr = 0.1, epochs = 10)
+    #     lr = 4*10^-2, epochs = 10, batch_size = 512,
+    #     units_layer1 = 1024, units_layer2 = 512, units_layer3 = 256, n_layers = 3L,
+    #     validation_split = 0.2, early_stopping_patience = 0, decay = 0.01,
+    #     dropout_rate = 0.3, embed_dropout_rate = 0.1,
+    #     learning_rate_scheduler = TRUE)
   mod = train(lrn, adult)
+  k_clear_session()
 
   #Get and plot embeddings
   res = mod$learner.model$next.model$learner.model
+  (plot(res$history) + ggtitle("+ dropout = 0.05"))
+
   model = res$model
   embds = get_embeddings(model, getTaskData(adult))
 
@@ -349,13 +341,19 @@ if (FALSE) {
   ggplot() + geom_text(aes(x = PC1, y = PC2, label = name))
 
   # Learning Rate finder
-  find_lr(mod)
+  find_lr(mod, epochs = 10)
+
+  # Tensorboard
+  tensorboard("~/Documents/tensorboard_logs")
 
   # --- 2071 Adult
   tsk = getOMLTask(2071)
   lrn = makeLearner("classif.embed_kerasff",
-      lr = 10^-5, epochs = 25, units_layer1 = 64, units_layer2 = 64, units_layer3 = 64, n_layers = 3L,
-      validation_split = 0.1, early_stopping_patience = 5)
+      lr = 4*10^-2, epochs = 10, batch_size = 512,
+      units_layer1 = 1024, units_layer2 = 512, units_layer3 = 256, n_layers = 3L,
+      validation_split = 0, early_stopping_patience = 0, decay = 0.01,
+      dropout_rate = 0.3, embed_dropout_rate = 0.1,
+      learning_rate_scheduler = TRUE)
   lrn = makePreprocWrapperCaret(
     makeImputeWrapper(lrn,
       classes = list(integer = imputeMedian(), numeric = imputeMedian(), factor = imputeConstant("_NA_")),
@@ -366,7 +364,7 @@ if (FALSE) {
   # --- 14966 Ozone
   tsk = getOMLTask(145855)
   lrn = makeLearner("classif.embed_kerasff",
-      lr = 10^-3, epochs = 50, units_layer1 = 1024, units_layer2 = 512, units_layer3 = 256, n_layers = 3L,
+      lr = 10^-3, epochs = 50, units_layer1 = 64, units_layer2 = 64, units_layer3 = 64, n_layers = 3L,
       validation_split = 0.1, early_stopping_patience = 10)
   lrn = makePreprocWrapperCaret(
     makeImputeWrapper(lrn,
@@ -375,5 +373,16 @@ if (FALSE) {
     ), "ppc.scale" = TRUE, "ppc.center" = TRUE)
   runTaskMlr(tsk, lrn)
 
+  tsk = getOMLTask(14971)
+  lrn = makeLearner("classif.embed_kerasff",
+      lr = 10^-1, epochs = 30, units_layer1 = 512, units_layer2 = 512, units_layer3 = 512, n_layers = 3L,
+      validation_split = 0.1, early_stopping_patience = 0, decay = 0.01,
+      dropout_rate = 0.1, embed_dropout_rate = 0.05)
+  lrn = makePreprocWrapperCaret(
+    makeImputeWrapper(lrn,
+      classes = list(integer = imputeMedian(), numeric = imputeMedian(), factor = imputeConstant("_NA_")),
+      dummy.classes = c("numeric", "integer") 
+    ), "ppc.scale" = TRUE, "ppc.center" = TRUE)
+  runTaskMlr(tsk, lrn)
 }
 

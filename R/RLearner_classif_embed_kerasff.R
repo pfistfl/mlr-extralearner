@@ -37,7 +37,8 @@ makeRLearner.classif.embed_kerasff = function() {
         lower = 0, upper = 1, default = 0),
       makeNumericLearnerParam(id = "validation_split",
         lower = 0, upper = 1, default = 0),
-      makeLogicalLearnerParam(id = "learning_rate_scheduler", default = TRUE)
+      makeLogicalLearnerParam(id = "learning_rate_scheduler", default = TRUE),
+      makeUntypedLearnerParam(id = "callbacks", default = c())
     ),
     properties = c("numerics", "factors", "prob", "twoclass", "multiclass"),
     par.vals = list(),
@@ -54,7 +55,8 @@ trainLearner.classif.embed_kerasff  = function(.learner, .task, .subset, .weight
   embed_dropout_rate = 0.05, dropout_rate = 0.4,
   n_layers = 3L,
   units_layer1 = 512, units_layer2 = 256, units_layer3 = 128, units_layer4 = 64,
-  l1_reg_layer = 0, l2_reg_layer = 0, validation_split = 0.2, tensorboard = FALSE) {
+  l1_reg_layer = 0, l2_reg_layer = 0, validation_split = 0.2, tensorboard = FALSE,
+  callbacks = c()) {
 
   require("keras")
   keras = reticulate::import("keras")
@@ -72,20 +74,21 @@ trainLearner.classif.embed_kerasff  = function(.learner, .task, .subset, .weight
     "nadam" = optimizer_nadam(lr, beta_1, beta_2, schedule_decay = decay)
   )
 
-  callbacks = c()
   if (early_stopping_patience > 0)
     callbacks = c(callbacks, callback_early_stopping(monitor = 'val_loss', patience = early_stopping_patience))
   if (learning_rate_scheduler) {
     n_batches = (1 - validation_split) * ceiling(getTaskSize(.task) / batch_size)
     # clr = function(x) ((sin(x / n_batches * 2 * pi) + 1)*exp(-x/5000) + .01)
     # clr = function(x) (min(10^-3, (sin(x / (epochs*n_batches) * pi))*exp(-x/5000) + .01))
+    make_saw = function(x, max_x, lin = 0.3) {
+      if (x <= lin * max_x) x / (lin * max_x)
+      else (cos((x - lin * max_x) / max_x * pi / (1 - lin)) + 1) / 2
+    }
     clr = function(x) {
+      n_saws = 5
       max_x = epochs*n_batches
-      lin = 0.3
-      c(
-        seq(from = 0, to = 1, length.out = ceiling(lin * max_x)),
-        (cos(x / max_x * pi) + 1) / 2
-      )
+      lrs = make_saw(x %% (max_x / n_saws), (max_x / n_saws)) + make_saw(x, max_x)
+      lrs/2 + 10^-8
     }
     callback_lr_init = function(x){
       iter <<- 0
@@ -104,7 +107,7 @@ trainLearner.classif.embed_kerasff  = function(.learner, .task, .subset, .weight
     callbacks = c(callbacks, callback_lr, callback_logger)
   }
   if (tensorboard)
-    callbacks = c(callbacks, callback_tensorboard("~/Documents/tensorboard_logs"))
+    callbacks = c(callbacks, callback_tensorboard())
 
   # --- Build Up Model -------------------------------------------------------
   units_layers = c(units_layer1, units_layer2, units_layer3, units_layer4)
@@ -316,18 +319,11 @@ if (FALSE) {
   library(dplyr)
   library(patchwork)
   adult = convertOMLDataSetToMlr(getOMLDataSet(1590))
-
   lrn = cpoImputeMedian(affect.type = "numeric") %>>%
     cpoImputeMode(affect.type = "factor") %>>%
     cpoScale(center = TRUE, scale = TRUE, affect.type = "numeric") %>>%
-    makeLearner("classif.embed_kerasff", lr = 0.1, epochs = 10)
-    #     lr = 4*10^-2, epochs = 10, batch_size = 512,
-    #     units_layer1 = 1024, units_layer2 = 512, units_layer3 = 256, n_layers = 3L,
-    #     validation_split = 0.2, early_stopping_patience = 0, decay = 0.01,
-    #     dropout_rate = 0.3, embed_dropout_rate = 0.1,
-    #     learning_rate_scheduler = TRUE)
-  mod = train(lrn, adult)
-  k_clear_session()
+    makeLearner("classif.embed_kerasff", lr = 0.1, epochs = 15)
+  mod = train(lrn); k_clear_session()
 
   #Get and plot embeddings
   res = mod$learner.model$next.model$learner.model
@@ -344,7 +340,7 @@ if (FALSE) {
   find_lr(mod, epochs = 10)
 
   # Tensorboard
-  tensorboard("~/Documents/tensorboard_logs")
+  tensorboard(".")
 
   # --- 2071 Adult
   tsk = getOMLTask(2071)
@@ -384,5 +380,9 @@ if (FALSE) {
       dummy.classes = c("numeric", "integer") 
     ), "ppc.scale" = TRUE, "ppc.center" = TRUE)
   runTaskMlr(tsk, lrn)
+
+  epochs = 15
+  n_batches = 308
+  plot(sapply(seq_len(epochs*n_batches), clr))
 }
 

@@ -38,7 +38,9 @@ makeRLearner.classif.embed_kerasff = function() {
       makeNumericLearnerParam(id = "validation_split",
         lower = 0, upper = 1, default = 0),
       makeLogicalLearnerParam(id = "learning_rate_scheduler", default = TRUE),
-      makeUntypedLearnerParam(id = "callbacks", default = c())
+      makeUntypedLearnerParam(id = "callbacks", default = c()),
+      makeLogicalLearnerParam(id = "mixup", default = FALSE),
+      makeLogicalLearnerParam(id = "smooth_labels", default = FALSE)
     ),
     properties = c("numerics", "factors", "prob", "twoclass", "multiclass"),
     par.vals = list(),
@@ -56,7 +58,10 @@ trainLearner.classif.embed_kerasff  = function(.learner, .task, .subset, .weight
   n_layers = 3L,
   units_layer1 = 512, units_layer2 = 256, units_layer3 = 128, units_layer4 = 64,
   l1_reg_layer = 0, l2_reg_layer = 0, validation_split = 0.2, tensorboard = FALSE,
-  callbacks = c()) {
+  callbacks = c(), mixup = FALSE, smooth_labels = FALSE, mixup_factor = 2) {
+
+  assert_flag(mixup)
+  assert_flag(smooth_labels)
 
   require("keras")
   keras = reticulate::import("keras")
@@ -70,7 +75,7 @@ trainLearner.classif.embed_kerasff  = function(.learner, .task, .subset, .weight
     "sgd" = optimizer_sgd(lr, momentum, decay = decay),
     "rmsprop" = optimizer_rmsprop(lr, rho, decay = decay),
     "adagrad" = optimizer_adagrad(lr, decay = decay),
-    "adam" = optimizer_adam(lr, beta_1, beta_2, decay = decay),
+    "adam" = optimizer_adam(lr, beta_1, beta_2, decay = decay, clipnorm = 1),
     "nadam" = optimizer_nadam(lr, beta_1, beta_2, schedule_decay = decay)
   )
 
@@ -87,8 +92,8 @@ trainLearner.classif.embed_kerasff  = function(.learner, .task, .subset, .weight
     clr = function(x) {
       n_saws = 5
       max_x = epochs*n_batches
-      lrs = make_saw(x %% (max_x / n_saws), (max_x / n_saws)) + make_saw(x, max_x)
-      lrs/2 + 10^-8
+      lrs = 0.3 * make_saw(x %% (max_x / n_saws), (max_x / n_saws)) + 0.7 * make_saw(x, max_x)
+      lrs + 10^-8
     }
     callback_lr_init = function(x){
       iter <<- 0
@@ -141,19 +146,24 @@ trainLearner.classif.embed_kerasff  = function(.learner, .task, .subset, .weight
   # --- Compile and Fit ---------------------------------------------------------------
   data = reshape_data_embedding(data$data, data$target)
   
+  if (mixup) data = mixup_data(data, factor = mixup_factor)
+  else data$label = to_categorical(data$label)  
+  
+  if (smooth_labels) data$label = smooth_labels(data$label, alpha = 0.95) 
+
   if (output_shape == 2) loss = "binary_crossentropy"
   else loss = "categorical_crossentropy"
-
+  
   model %>% compile(
     optimizer = optimizer,
     loss = loss,
-    metrics = "accuracy"
+    metrics = "categorical_accuracy"
   )
 
   if (epochs > 0) {
     history = model %>% fit(
       x = data$data,
-      y = to_categorical(data$label),
+      y = data$label,
       batch_size = batch_size,
       epochs  = epochs,
       validation_split = validation_split
@@ -231,6 +241,47 @@ make_embedding = function(data, embed_size = NULL, embed_dropout = 0) {
    return(list(inputs = lapply(embds, function(x) x$input), layers = layers))
 }
 
+smooth_labels = function(labels, alpha = 0.9) {
+  if (alpha == 1) return(labels)
+  t(apply(labels, 1, function(x) {
+    alpha * x + (1 - alpha) / length(x)
+  }))
+}
+
+mixup_data = function(data, factor, alpha) {
+  assert_true(factor >= 1)
+
+  if (factor == 1) return(data)
+  n = nrow(data$label)
+  n_points = ceiling(n * factor - n)
+  alpha = rbeta(n_points, shape1 = 0.1, shape2 = 0.1)
+  ids = sample(seq_len(n), n_points*2, replace = TRUE)
+  labs = to_categorical(data$label[ids,])
+  data$data[names(data$data) != "continuous"] = data.frame(lapply(data$data[names(data$data) != "continuous"],
+    function(x) {
+      pairs = split(ids, seq_len(ceiling(n_points)))
+      z = unlist(Map(
+        function(y, alpha) {sample(y, 1, prob = c(alpha, 1-alpha))},
+        pairs, alpha
+      ))
+      c(x, x[z])
+  }))
+  data$data$continuous = rbind(
+    data$data$continuous,
+    t(sapply(seq_len(n_points), function(i) {
+      idx = ids[c(i*2 - 1, i*2)]
+      cont = t(as.matrix(data$data$continuous[idx, ])) %*% matrix(c(alpha[i], 1-alpha[i]), nrow = 2)
+    }))
+  )
+  data$label = rbind(
+    to_categorical(data$label), 
+    t(sapply(seq_len(n_points), function(i) {
+      t(as.matrix(labs[c(i*2 - 1, i*2), ])) %*% matrix(c(alpha[i], 1-alpha[i]), nrow = 2)
+    }))
+  )
+  return(data)
+}
+
 get_embeddings = function(model, data) {
   assert_data_frame(data)
   assert_class(model, "keras.engine.training.Model")
@@ -254,16 +305,17 @@ get_embeddings = function(model, data) {
 }
 
 
+
 # http://thecooldata.com/2019/01/learning-rate-finder-with-cifar10-keras-r/
 find_lr = function(mlr_mod, batch_size = 128, epochs = 5) {
   requireNamespace("zoo")
-  res = mlr_mod$learner.model$next.model$learner.model
+  res = getLearnerModel(mlr_mod, more.unwrap = TRUE)
   model = res$model
   n = nrow(res$data$label)
 
   LogMetrics = R6::R6Class("LogMetrics",
     inherit = KerasCallback,
-    public = list(
+    public = list( 
       loss = NULL,
       acc = NULL,
       on_batch_end = function(batch, logs=list()) {
@@ -299,16 +351,22 @@ find_lr = function(mlr_mod, batch_size = 128, epochs = 5) {
 
   history = model %>% fit(
       x = res$data$data,
-      y =  to_categorical(res$data$label),
+      y =  res$data$label,
       batch_size = batch_size,
       epochs = epochs,
       shuffle = TRUE,
       callbacks = list(callback_lr, callback_logger, callback_log_acc_lr),
       verbose = 2)
-  plot(zoo::rollmean(lr_hist, 100), zoo::rollmean(callback_log_acc_lr$acc, 100), log="x", type="l", pch=16, cex=0.3, xlab="learning rate", ylab="accuracy: rollmean(100)")
+  k_clear_session()
+  plot(zoo::rollmean(lr_hist, 100), zoo::rollmean(callback_log_acc_lr$loss, 100), log="x", type="l", pch=16, cex=0.3, xlab="learning rate", ylab="loss: rollmean(100)")
   return(history)
 }
 
+lr_finder = function(lrn, tsk, epochs = 5) {
+  lrn = setHyperPars(lrn, epochs = 0)
+  mod = train(lrn, tsk)
+  find_lr(mod, epochs = epochs)
+}
 
 if (FALSE) {
   # Some tests and checks
@@ -323,7 +381,7 @@ if (FALSE) {
     cpoImputeMode(affect.type = "factor") %>>%
     cpoScale(center = TRUE, scale = TRUE, affect.type = "numeric") %>>%
     makeLearner("classif.embed_kerasff", lr = 0.1, epochs = 15)
-  mod = train(lrn); k_clear_session()
+  mod = train(lrn, adult); k_clear_session()
 
   #Get and plot embeddings
   res = mod$learner.model$next.model$learner.model
@@ -357,32 +415,39 @@ if (FALSE) {
     ), "ppc.scale" = TRUE, "ppc.center" = TRUE)
   runTaskMlr(tsk, lrn)
 
-  # --- 14966 Ozone
+  # --- 145855 Ozone
   tsk = getOMLTask(145855)
-  lrn = makeLearner("classif.embed_kerasff",
-      lr = 10^-3, epochs = 50, units_layer1 = 64, units_layer2 = 64, units_layer3 = 64, n_layers = 3L,
-      validation_split = 0.1, early_stopping_patience = 10)
+  lrn = makeLearner("classif.embed_kerasff", lr = 0.01, mixup = TRUE, validation_split = 0)
   lrn = makePreprocWrapperCaret(
     makeImputeWrapper(lrn,
       classes = list(integer = imputeMedian(), numeric = imputeMedian(), factor = imputeConstant("_NA_")),
       dummy.classes = c("numeric", "integer") 
     ), "ppc.scale" = TRUE, "ppc.center" = TRUE)
   runTaskMlr(tsk, lrn)
-
+  # Default: 0.8543804
+  # mixup:   0.9198895
+  # bestcfg: 0.9463299
+  # bestoml: 0.9499
+  
+  # Click-prediction small
   tsk = getOMLTask(14971)
-  lrn = makeLearner("classif.embed_kerasff",
-      lr = 10^-1, epochs = 30, units_layer1 = 512, units_layer2 = 512, units_layer3 = 512, n_layers = 3L,
-      validation_split = 0.1, early_stopping_patience = 0, decay = 0.01,
-      dropout_rate = 0.1, embed_dropout_rate = 0.05)
+  lrn = makeLearner("classif.embed_kerasff", validation_split = 0, lr = 10^-2, units_layer1 = 64, units_layer2 = 64, units_layer3 = 64)
   lrn = makePreprocWrapperCaret(
     makeImputeWrapper(lrn,
       classes = list(integer = imputeMedian(), numeric = imputeMedian(), factor = imputeConstant("_NA_")),
       dummy.classes = c("numeric", "integer") 
     ), "ppc.scale" = TRUE, "ppc.center" = TRUE)
+  # lr_finder(lrn, convertOMLTaskToMlr(tsk)$mlr.task, 10)
   runTaskMlr(tsk, lrn)
+  # Default:    0.8319565
+  # No valid:   0.8318063    
+  # bestcfg:    0.8318 
+  # bestoml:    0.8383
+
 
   epochs = 15
   n_batches = 308
   plot(sapply(seq_len(epochs*n_batches), clr))
 }
+
 

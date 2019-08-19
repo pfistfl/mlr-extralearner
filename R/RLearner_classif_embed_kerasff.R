@@ -160,13 +160,29 @@ trainLearner.classif.embed_kerasff  = function(.learner, .task, .subset, .weight
     metrics = "categorical_accuracy"
   )
 
+  btch = lapply(data$data, function(x) {if (is.null(dim(x))) z = x[seq_len(128)] else z = x[seq_len(128),]; return(z)})
+  cb = callback_lambda(
+    on_train_begin = function(logs) {wt_stats <<- c()}, 
+    on_epoch_begin = function(batch, logs) {
+      acts = c("leaky_re_lu", "leaky_re_lu_1", "leaky_re_lu_2")
+      get_acts_funs = function(model, act) {
+        imod = keras_model(inputs = model$input, outputs = get_layer(model, act)$output)
+        iout = predict(imod, btch)
+        data.frame(mean = apply(iout, 2, mean), sd = apply(iout, 2, sd), layer = act, iter = iter)
+      }
+      wt_stats <<- c(wt_stats, lapply(acts, get_acts_funs, model = model))
+    }
+  )
+  callbacks = c(callbacks, cb)
+
   if (epochs > 0) {
     history = model %>% fit(
       x = data$data,
       y = data$label,
       batch_size = batch_size,
       epochs  = epochs,
-      validation_split = validation_split
+      validation_split = validation_split,
+      callbacks = callbacks
     )
   }
   return(list(model = model, history = history, target_levels = target_levels, data = data, history = history))
@@ -380,12 +396,17 @@ if (FALSE) {
   lrn = cpoImputeMedian(affect.type = "numeric") %>>%
     cpoImputeMode(affect.type = "factor") %>>%
     cpoScale(center = TRUE, scale = TRUE, affect.type = "numeric") %>>%
-    makeLearner("classif.embed_kerasff", lr = 0.1, epochs = 15)
+    makeLearner("classif.embed_kerasff", lr = 0.1, epochs = 10)
   mod = train(lrn, adult); k_clear_session()
 
   #Get and plot embeddings
   res = mod$learner.model$next.model$learner.model
   (plot(res$history) + ggtitle("+ dropout = 0.05"))
+
+
+  ggplot(do.call("rbind", wt_stats)) +
+    geom_point(aes(x = mean, y = sd)) +
+    facet_grid(layer~iter)
 
   model = res$model
   embds = get_embeddings(model, getTaskData(adult))
@@ -451,3 +472,6 @@ if (FALSE) {
 }
 
 
+if (FALSE) {
+
+}

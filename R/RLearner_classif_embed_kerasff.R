@@ -55,11 +55,13 @@ trainLearner.classif.embed_kerasff  = function(.learner, .task, .subset, .weight
   tensorboard = FALSE,
   callbacks = c(), mixup = FALSE, smooth_labels = FALSE, mixup_factor = 2) {
 
-  assert_flag(mixup)
-  assert_flag(smooth_labels)
-
   require("keras")
   keras = reticulate::import("keras")
+  assert_flag(mixup)
+  assert_flag(smooth_labels)
+  assert_count(early_stopping_patience)
+  assert_flag(learning_rate_scheduler)
+
   input_shape = getTaskNFeats(.task)
   output_shape = length(getTaskClassLevels(.task))
   data = getTaskData(.task, .subset, target.extra = TRUE)
@@ -75,10 +77,10 @@ trainLearner.classif.embed_kerasff  = function(.learner, .task, .subset, .weight
   if (early_stopping_patience > 0)
     callbacks = c(callbacks, callback_early_stopping(monitor = 'val_loss', patience = early_stopping_patience))
 
+  if (tensorboard) callbacks = c(callbacks, callback_tensorboard())
+
   if (learning_rate_scheduler) {
     n_batches = (1 - validation_split) * ceiling(getTaskSize(.task) / batch_size)
-
-
     # Trying out different learning rate schedulers
     # clr = function(x) ((sin(x / n_batches * 2 * pi) + 1)*exp(-x/5000) + .01)
     # clr = function(x) (min(10^-3, (sin(x / (epochs*n_batches) * pi))*exp(-x/5000) + .01))
@@ -107,7 +109,6 @@ trainLearner.classif.embed_kerasff  = function(.learner, .task, .subset, .weight
     callback_logger = callback_lambda(on_batch_begin=callback_lr_log)
     callbacks = c(callbacks, callback_lr, callback_logger)
   }
-  if (tensorboard) callbacks = c(callbacks, callback_tensorboard())
 
   # --- Build Up Model -------------------------------------------------------
   units_layers = c(units_layer1, units_layer2, units_layer3, units_layer4)
@@ -125,13 +126,13 @@ trainLearner.classif.embed_kerasff  = function(.learner, .task, .subset, .weight
   for (i in seq_len(n_layers + 1L)) {
     if (i > 1) {
       layers = layers %>%
-        layer_batch_normalization() %>%
+        layer_batch_normalization(epsilon = 0.01) %>%
         layer_dropout(dropout_rate)
     }
     # Final layer
     if (i < n_layers + 1)
     layers = layers %>%
-      layer_dense(units = units_layers[i], kernel_initializer = initializer_he_normal()) %>%
+      layer_dense(units = units_layers[i], kernel_initializer = initializer_he_uniform()) %>%
       layer_activation_leaky_relu(alpha = 0.3)
     else
       layers = layers %>% layer_dense(units = output_shape) %>% layer_activation_softmax()
@@ -150,26 +151,12 @@ trainLearner.classif.embed_kerasff  = function(.learner, .task, .subset, .weight
 
   if (output_shape == 2) loss = "binary_crossentropy"
   else loss = "categorical_crossentropy"
+
   model %>% compile(
     optimizer = optimizer,
     loss = loss,
     metrics = "categorical_accuracy"
   )
-
-  btch = lapply(data$data, function(x) {if (is.null(dim(x))) z = x[seq_len(128)] else z = x[seq_len(128),]; return(z)})
-  cb = callback_lambda(
-    on_train_begin = function(logs) {wt_stats <<- c()}, 
-    on_epoch_begin = function(batch, logs) {
-      acts = c("leaky_re_lu", "leaky_re_lu_1", "leaky_re_lu_2")
-      get_acts_funs = function(model, act) {
-        imod = keras_model(inputs = model$input, outputs = get_layer(model, act)$output)
-        iout = predict(imod, btch)
-        data.frame(mean = apply(iout, 2, mean), sd = apply(iout, 2, sd), layer = act, iter = iter)
-      }
-      wt_stats <<- c(wt_stats, lapply(acts, get_acts_funs, model = model))
-    }
-  )
-  callbacks = c(callbacks, cb)
 
   if (epochs > 0) {
     history = model %>% fit(
@@ -199,6 +186,11 @@ predictLearner.classif.embed_kerasff = function(.learner, .model, .newdata, ...)
   return(p)
 }
 
+
+#' Reshape a dataset for use with entity embeddings.
+#' continuous vars are stored in a matrix "continuous"
+#' every categorical variable is integer encoded and stored
+#' as a single list element.
 reshape_data_embedding = function(data, target) {
   assert_factor(target, null.ok = TRUE)
   assert_data_frame(data)
@@ -219,6 +211,9 @@ reshape_data_embedding = function(data, target) {
     )
 }
 
+# Create the embedding for a dataset.
+# Creates an input for each categorical var, concatenates those,
+# Adds batch-norm to continuous vars etc.
 make_embedding = function(data, embed_size = NULL, embed_dropout = 0) {
   assert_data_frame(data)
   assert_numeric(embed_size, null.ok = TRUE)
@@ -237,7 +232,9 @@ make_embedding = function(data, embed_size = NULL, embed_dropout = 0) {
       if (length(embed_size) == 0) embed_size = min(600L, round(1.6 * n_cat^0.56))
       input = layer_input(shape = 1, dtype = "int32", name = feat_name)
       layers = input %>%
-      layer_embedding(input_dim = as.numeric(n_cat), output_dim = as.numeric(embed_size), input_length = 1, name = paste0("embed_", feat_name)) %>%
+      layer_embedding(input_dim = as.numeric(n_cat), output_dim = as.numeric(embed_size),
+        input_length = 1, name = paste0("embed_", feat_name),
+        embeddings_initializer = initializer_he_uniform()) %>%
       layer_dropout(embed_dropout, input_shape = as.numeric(embed_size)) %>%
       layer_flatten()
       return(list(input = input, layers = layers))
@@ -246,7 +243,7 @@ make_embedding = function(data, embed_size = NULL, embed_dropout = 0) {
   # Layer for the continuous variables
   if (n_cont > 0) {
     input = layer_input(shape = n_cont, dtype = "float32", name = "continuous")
-    layers = input %>% layer_batch_normalization(input_shape = n_cont, axis = -1)
+    layers = input %>% layer_batch_normalization(input_shape = n_cont, axis = 1)
     embds = c(embds, list(cont = list(input = input, layers = layers)))
   }
 
@@ -267,7 +264,6 @@ smooth_labels = function(labels, alpha = 0.9) {
 
 mixup_data = function(data, factor, alpha) {
   assert_true(factor >= 1)
-
   if (factor == 1) return(data)
   n = nrow(data$label)
   n_points = ceiling(n * factor - n)
@@ -299,27 +295,6 @@ mixup_data = function(data, factor, alpha) {
   return(data)
 }
 
-get_embeddings = function(model) {
-  assert_class(model, "WrappedModel")
-  learner_model = mlr:::getLearnerModel(model, more.unwrap = TRUE)
-  model = learner_model$model
-  fct_levels = learner_model$fct_levels
-  names(fct_levels) = paste0("embed_", names(fct_levels))
-
-  layers = sapply(model$layers, function(x) x$name)
-  embed_layers = layers[grepl("embed", layers)]
-
-  wts = setNames(lapply(embed_layers,
-    function(layer) {
-      wt = get_layer(model, layer)$get_weights()[[1]]
-      colnames(wt) = paste0(layer, seq_len(ncol(wt)))
-      rownames(wt) = fct_levels[[layer]]
-      return(wt)
-    }), embed_layers)
-  return(wts)
-}
-
-
 
 #' Return data with embeddings.
 #' @param model mlr mdoel
@@ -343,7 +318,37 @@ embed_with_model = function(model, data, na_level = "_NA_") {
   return(data)
 }
 
+get_embeddings = function(model) {
+  assert_class(model, "WrappedModel")
+  learner_model = mlr:::getLearnerModel(model, more.unwrap = TRUE)
+  model = learner_model$model
+  fct_levels = learner_model$fct_levels
+  names(fct_levels) = paste0("embed_", names(fct_levels))
 
+  layers = sapply(model$layers, function(x) x$name)
+  embed_layers = layers[grepl("embed", layers)]
+
+  wts = setNames(lapply(embed_layers,
+    function(layer) {
+      wt = get_layer(model, layer)$get_weights()[[1]]
+      colnames(wt) = paste0(layer, seq_len(ncol(wt)))
+      rownames(wt) = fct_levels[[layer]]
+      return(wt)
+    }), embed_layers)
+  return(wts)
+}
+
+
+# Implementation of a learning rate finder.
+# This is a wrapper around find_lr, that creates the model
+# and returns the learning rate.
+lr_finder = function(lrn, tsk, epochs = 5) {
+  lrn = setHyperPars(lrn, epochs = 0)
+  mod = train(lrn, tsk)
+  find_lr(mod, epochs = epochs)
+}
+
+# Adapted from
 # http://thecooldata.com/2019/01/learning-rate-finder-with-cifar10-keras-r/
 find_lr = function(mlr_mod, batch_size = 128, epochs = 5) {
   requireNamespace("zoo")
@@ -400,40 +405,48 @@ find_lr = function(mlr_mod, batch_size = 128, epochs = 5) {
   return(history)
 }
 
-lr_finder = function(lrn, tsk, epochs = 5) {
-  lrn = setHyperPars(lrn, epochs = 0)
-  mod = train(lrn, tsk)
-  find_lr(mod, epochs = epochs)
-}
+
+
 
 if (FALSE) {
-  # Some tests and checks
+  # Some tests, checks and example code
   library(OpenML)
   library(checkmate)
   library(mlrCPO)
+  library(keras)
   adult = convertOMLDataSetToMlr(getOMLDataSet(1590))
   lrn = cpoImputeMedian(affect.type = "numeric") %>>%
     cpoImputeConstant(affect.type = "factor", const = "_NA_") %>>%
     cpoScale(center = TRUE, scale = TRUE, affect.type = "numeric") %>>%
-    makeLearner("classif.embed_kerasff", lr = 0.1, epochs = 10)
-  mod = train(lrn, adult); k_clear_session()
+    makeLearner("classif.embed_kerasff", lr = 0.1, epochs = 5,
+      units_layer3 = 128, units_layer2 = 128, units_layer1 = 128,
+      decay = 0.1)
+  k_clear_session()
+  mod = train(lrn, adult)
 
-  #Get and plot embeddings
-  res = mod$learner.model$next.model$learner.model
+  # Plot history
+  res = mlr:::getLearnerModel(mod, more.unwrap = TRUE)
   plot(res$history)
 
+  # Plot weight stats (needs callback "callback_wt_stats")
+  library(ggplot2)
   ggplot(do.call("rbind", wt_stats)) +
     geom_point(aes(x = mean, y = sd)) +
-    facet_grid(layer~iter)
+    facet_grid(iter~layer, scales = "free")
 
+  # Get the embeddings
   model = res$model
   embds = get_embeddings(model, getTaskData(adult))
 
-  embds = get_embeddings(mod)
-  data_embd = embed_with_model(mod, getTaskData(adult))
-  resample("classif.ranger", adult, hout)
-  resample("classif.ranger", makeClassifTask(data = data_embd, target = "class"), hout)
+  resample(
+    makePreprocWrapperCaret(
+    makeImputeWrapper("classif.ranger",
+      classes = list(integer = imputeMedian(), numeric = imputeMedian(), factor = imputeConstant("_NA_")),
+      dummy.classes = c("numeric", "integer")
+    ), "ppc.scale" = TRUE, "ppc.center" = TRUE),
+    adult, hout, measures = acc)
 
+  # Plot PCA Projections
   data.frame(prcomp(embds$embed_occupation)$x) %>%
   mutate(name = rownames(.)) %>%
   ggplot() + geom_text(aes(x = PC1, y = PC2, label = name))
@@ -447,11 +460,9 @@ if (FALSE) {
   # --- 2071 Adult
   tsk = getOMLTask(2071)
   lrn = makeLearner("classif.embed_kerasff",
-      lr = 4*10^-2, epochs = 10, batch_size = 512,
-      units_layer1 = 1024, units_layer2 = 512, units_layer3 = 256, n_layers = 3L,
-      validation_split = 0, early_stopping_patience = 0, decay = 0.01,
-      dropout_rate = 0.3, embed_dropout_rate = 0.1,
-      learning_rate_scheduler = TRUE)
+      "classif.embed_kerasff", lr = 0.1, epochs = 10,
+      units_layer3 = 128, units_layer2 = 128, units_layer1 = 128,
+      decay = 0.1, validation_split = 0)
   lrn = makePreprocWrapperCaret(
     makeImputeWrapper(lrn,
       classes = list(integer = imputeMedian(), numeric = imputeMedian(), factor = imputeConstant("_NA_")),
@@ -488,3 +499,21 @@ if (FALSE) {
   # bestcfg:    0.8318
   # bestoml:    0.8383
 }
+
+
+callback_wt_stats = callback_lambda(
+    on_train_begin = function(logs) {wt_stats <<- c()},
+    on_epoch_begin = function(batch, logs) {
+      acts = c("leaky_re_lu", "leaky_re_lu_1", "leaky_re_lu_2")
+      get_acts_funs = function(model, act) {
+        btch = lapply(data$data, function(x) {
+          if (is.null(dim(x))) z = x[seq_len(128)] else z = x[seq_len(128),]; return(z)
+        })
+        imod = keras_model(inputs = model$input, outputs = get_layer(model, act)$output)
+        iout = predict(imod, btch)
+        data.frame("mean" = apply(iout, 2, mean), "sd" = apply(iout, 2, sd), "layer" = act, "iter" = iter)
+      }
+      wt_stats <<- c(wt_stats, lapply(acts, get_acts_funs, model = model))
+    }
+)
+

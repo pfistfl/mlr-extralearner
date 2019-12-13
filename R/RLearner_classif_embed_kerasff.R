@@ -406,6 +406,11 @@ lr_finder = function(lrn, tsk, epochs = 5) {
   find_lr(mod, epochs = epochs)
 }
 
+
+
+
+
+
 if (FALSE) {
   # Some tests and checks
   library(OpenML)
@@ -429,8 +434,7 @@ if (FALSE) {
   model = res$model
   embds = get_embeddings(model, getTaskData(adult))
 
-  embds = get_embeddings(mod)
-  data_embd = embed_with_model(mod, getTaskData(adult))
+
   resample("classif.ranger", adult, hout)
   resample("classif.ranger", makeClassifTask(data = data_embd, target = "class"), hout)
 

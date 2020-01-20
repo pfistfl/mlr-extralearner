@@ -408,6 +408,11 @@ find_lr = function(mlr_mod, batch_size = 128, epochs = 5) {
 
 
 
+
+
+
+
+
 if (FALSE) {
   # Some tests, checks and example code
   library(OpenML)
@@ -437,6 +442,9 @@ if (FALSE) {
   # Get the embeddings
   model = res$model
   embds = get_embeddings(model, getTaskData(adult))
+
+  resample("classif.ranger", adult, hout)
+  resample("classif.ranger", makeClassifTask(data = data_embd, target = "class"), hout)
 
   resample(
     makePreprocWrapperCaret(
